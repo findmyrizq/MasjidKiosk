@@ -4,6 +4,8 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.KeyEvent
 import android.widget.TextView
@@ -17,10 +19,16 @@ class MainActivity : AppCompatActivity() {
 
         // Window in ms — returns must happen within this time to count as consecutive
         const val CONSECUTIVE_WINDOW_MS = 6000L
+
+        // BACK presses on the setup screen before skipping is offered
+        const val SETUP_ATTEMPTS_BEFORE_SKIP = 3
     }
 
     private var returnCount = 0
     private var lastReturnTime = 0L
+    private var settingUp = false
+    private var setupAttempts = 0
+    private val handler = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -30,6 +38,24 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+
+        // Overlay permission unblocks background relaunch on Fire OS 8+.
+        // Hold the kiosk in setup mode until it is granted (or explicitly skipped).
+        if (overlayNeeded()) {
+            settingUp = true
+            setupAttempts++
+            val skipHint = if (setupAttempts >= SETUP_ATTEMPTS_BEFORE_SKIP)
+                "\n\n(Press BACK to skip this setup — the kiosk will be weaker on this Fire OS)" else ""
+            showStatus(
+                "ONE-TIME SETUP\n\n" +
+                    "In the screen that opens, select \"Masjid Kiosk\" " +
+                    "and turn ON \"Display over other apps\".\n\n" +
+                    "Then press BACK to return here.\n\nOpening settings…$skipHint"
+            )
+            handler.postDelayed({ if (settingUp && overlayNeeded()) openOverlaySettings() }, 1500)
+            return
+        }
+        settingUp = false
 
         if (!Kiosk.locked) {
             showStatus(pausedMessage())
@@ -54,6 +80,22 @@ class MainActivity : AppCompatActivity() {
             )
             if (!Kiosk.launchTarget(this)) showDiagnostics()
         }
+    }
+
+    private fun overlayNeeded(): Boolean =
+        Build.VERSION.SDK_INT >= 29 && !Settings.canDrawOverlays(this) &&
+            !getSharedPreferences("kiosk", MODE_PRIVATE).getBoolean("overlay_skipped", false)
+
+    override fun onBackPressed() {
+        if (settingUp && setupAttempts >= SETUP_ATTEMPTS_BEFORE_SKIP) {
+            getSharedPreferences("kiosk", MODE_PRIVATE)
+                .edit().putBoolean("overlay_skipped", true).apply()
+            settingUp = false
+            showStatus("Setup skipped. Starting kiosk…")
+            if (!Kiosk.launchTarget(this)) showDiagnostics()
+            return
+        }
+        super.onBackPressed()
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
@@ -91,11 +133,17 @@ class MainActivity : AppCompatActivity() {
                 Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
             )
         } catch (e: Exception) {
+            // Settings screen missing on this Fire OS build — don't trap the kiosk
+            getSharedPreferences("kiosk", MODE_PRIVATE)
+                .edit().putBoolean("overlay_skipped", true).apply()
+            settingUp = false
             showStatus(
                 "This Fire OS build does not expose the overlay setting.\n\n" +
-                    "Grant it via ADB instead:\n" +
-                    "adb shell appops set $packageName SYSTEM_ALERT_WINDOW allow"
+                    "Optional, via ADB:\n" +
+                    "adb shell appops set $packageName SYSTEM_ALERT_WINDOW allow\n\n" +
+                    "Starting kiosk anyway…"
             )
+            handler.postDelayed({ Kiosk.launchTarget(this) }, 6000)
         }
     }
 
